@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -31,23 +31,88 @@ st.markdown("""
         font-size: 0.9rem;
         margin-bottom: 0.5rem;
     }
+    .flag { color: #e74c3c; font-weight: bold; }
+    .ok   { color: #2ecc71; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Load credentials ──────────────────────────────────────────────────────────
 try:
-    account_id = st.secrets["CF_ACCOUNT_ID"]
-    api_token  = st.secrets["CF_API_TOKEN"]
-    # Comma-separated list of valid access passwords
-    # e.g. PASSWORDS = "fiverr-client-abc,fiverr-client-xyz,myownpassword"
+    account_id    = st.secrets["CF_ACCOUNT_ID"]
+    api_token     = st.secrets["CF_API_TOKEN"]
+    sb_url        = st.secrets["SUPABASE_URL"]
+    sb_key        = st.secrets["SUPABASE_KEY"]
+    admin_password = st.secrets.get("ADMIN_PASSWORD", "admin123")
     valid_passwords = [p.strip() for p in st.secrets.get("PASSWORDS", "").split(",") if p.strip()]
 except Exception as e:
     st.error(f"Server configuration error: {e}")
     st.stop()
 
+# ── Supabase helpers ──────────────────────────────────────────────────────────
+SB_HEADERS = {
+    "apikey": sb_key,
+    "Authorization": f"Bearer {sb_key}",
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal"
+}
+
+def sb_insert(table, data):
+    try:
+        requests.post(f"{sb_url}/rest/v1/{table}", headers=SB_HEADERS, json=data, timeout=5)
+    except Exception:
+        pass
+
+def sb_select(table, filters=""):
+    try:
+        r = requests.get(f"{sb_url}/rest/v1/{table}?{filters}&order=timestamp.desc",
+                         headers={**SB_HEADERS, "Prefer": "return=representation"}, timeout=5)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+def sb_delete(table, column, value):
+    try:
+        requests.delete(f"{sb_url}/rest/v1/{table}?{column}=eq.{value}",
+                        headers=SB_HEADERS, timeout=5)
+    except Exception:
+        pass
+
+def get_ip_info():
+    try:
+        r = requests.get("https://ipapi.co/json/", timeout=5)
+        if r.status_code == 200:
+            d = r.json()
+            return d.get("ip", "unknown"), d.get("country_name", "unknown"), d.get("city", "unknown")
+    except Exception:
+        pass
+    return "unknown", "unknown", "unknown"
+
+def log_access(password, ip, country, city, device):
+    sb_insert("access_logs", {
+        "password": password,
+        "ip_address": ip,
+        "country": country,
+        "city": city,
+        "device": device,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+def check_suspicious(password, current_ip):
+    logs = sb_select("access_logs", f"password=eq.{password}&limit=100")
+    if not logs:
+        return False, 0, []
+    ips = list(set(l.get("ip_address", "") for l in logs if l.get("ip_address") != "unknown"))
+    countries = list(set(l.get("country", "") for l in logs if l.get("country") != "unknown"))
+    suspicious = len(ips) >= 5 or len(countries) >= 3
+    return suspicious, len(ips), countries
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+if "current_password" not in st.session_state:
+    st.session_state.current_password = ""
 
 if not st.session_state.authenticated:
     st.markdown("## ✉️ Cold Email Writer Pro")
@@ -55,11 +120,68 @@ if not st.session_state.authenticated:
     st.divider()
     pwd = st.text_input("Access password", type="password", placeholder="Enter your password")
     if st.button("Login", use_container_width=True, type="primary"):
-        if pwd in valid_passwords:
+        if pwd == admin_password:
             st.session_state.authenticated = True
+            st.session_state.is_admin = True
+            st.session_state.current_password = "admin"
+            st.rerun()
+        elif pwd in valid_passwords:
+            ip, country, city = get_ip_info()
+            device = "Browser"
+            suspicious, ip_count, countries = check_suspicious(pwd, ip)
+            log_access(pwd, ip, country, city, device)
+            st.session_state.authenticated = True
+            st.session_state.is_admin = False
+            st.session_state.current_password = pwd
+            if suspicious:
+                st.session_state.suspicious_alert = f"⚠️ Password used from {ip_count} IPs across {countries}"
             st.rerun()
         else:
             st.error("Incorrect password. Please check your access code.")
+    st.stop()
+
+# ── Admin dashboard ───────────────────────────────────────────────────────────
+if st.session_state.is_admin:
+    st.markdown("## 🛡️ Admin Dashboard")
+    st.divider()
+
+    logs = sb_select("access_logs", "limit=200")
+
+    if logs:
+        # Group by password
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for log in logs:
+            grouped[log.get("password", "unknown")].append(log)
+
+        st.markdown(f"### 👥 Active passwords ({len(grouped)} total)")
+        for pwd_key, entries in grouped.items():
+            ips = list(set(e.get("ip_address", "") for e in entries if e.get("ip_address") != "unknown"))
+            countries = list(set(e.get("country", "") for e in entries if e.get("country") != "unknown"))
+            last_seen = entries[0].get("timestamp", "")[:16].replace("T", " ") if entries else "never"
+            suspicious = len(ips) >= 5 or len(countries) >= 3
+
+            flag = "🚨 FLAGGED" if suspicious else "✅ Normal"
+            with st.expander(f"{flag} · `{pwd_key}` · {len(entries)} logins · Last: {last_seen}"):
+                st.markdown(f"**Unique IPs:** {len(ips)} — {', '.join(ips[:10])}")
+                st.markdown(f"**Countries:** {', '.join(countries) if countries else 'unknown'}")
+
+                st.markdown("**Recent logins:**")
+                for e in entries[:5]:
+                    ts = e.get("timestamp", "")[:16].replace("T", " ")
+                    st.markdown(f"- {ts} · {e.get('country','?')} · {e.get('city','?')} · {e.get('ip_address','?')}")
+
+                if st.button(f"🚫 Revoke access for `{pwd_key}`", key=f"revoke_{pwd_key}"):
+                    sb_delete("access_logs", "password", pwd_key)
+                    st.success(f"Revoked all logs for `{pwd_key}`. Remove from PASSWORDS in secrets to block login.")
+    else:
+        st.info("No access logs yet.")
+
+    st.divider()
+    if st.button("Sign out"):
+        st.session_state.authenticated = False
+        st.session_state.is_admin = False
+        st.rerun()
     st.stop()
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -94,6 +216,10 @@ def extract_json(raw):
     return json.loads(match.group())
 
 # ── Header ────────────────────────────────────────────────────────────────────
+if hasattr(st.session_state, "suspicious_alert"):
+    st.warning(st.session_state.suspicious_alert)
+    del st.session_state.suspicious_alert
+
 c1, c2 = st.columns([4, 1])
 with c1:
     st.markdown("## ✉️ Cold Email Writer Pro")
@@ -101,6 +227,7 @@ with c1:
 with c2:
     if st.button("Sign out", key="signout"):
         st.session_state.authenticated = False
+        st.session_state.current_password = ""
         st.rerun()
 
 st.divider()
