@@ -3,18 +3,19 @@ import requests
 import json
 import re
 from datetime import datetime
+from streamlit_google_auth import Authenticate
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Cold Email Writer Pro",
     page_icon="✉️",
-    layout="wide",
+    layout="centered",
 )
 
 # ── Styling ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.5rem; }
+    .block-container { max-width: 860px; padding-top: 1.5rem; }
     .email-box {
         background: #f8f8f8;
         border: 1px solid #e0e0e0;
@@ -31,52 +32,72 @@ st.markdown("""
         font-size: 0.9rem;
         margin-bottom: 0.5rem;
     }
-    .score-box {
-        border-radius: 10px;
-        padding: 0.8rem 1rem;
+    .login-box {
+        max-width: 400px;
+        margin: 4rem auto;
         text-align: center;
-        font-size: 1.5rem;
-        font-weight: bold;
-    }
-    .history-item {
-        background: #f8f8f8;
+        padding: 2rem;
         border: 1px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 0.8rem 1rem;
-        margin-bottom: 0.5rem;
-        font-size: 0.85rem;
-        cursor: pointer;
+        border-radius: 16px;
+        background: #fafafa;
     }
-    div[data-testid="stHorizontalBlock"] { align-items: flex-start; }
 </style>
 """, unsafe_allow_html=True)
-
-# ── Session state init ────────────────────────────────────────────────────────
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "current_email" not in st.session_state:
-    st.session_state.current_email = None
-if "current_subject" not in st.session_state:
-    st.session_state.current_subject = None
-if "variation_b" not in st.session_state:
-    st.session_state.variation_b = None
-if "subject_b" not in st.session_state:
-    st.session_state.subject_b = None
-if "followup" not in st.session_state:
-    st.session_state.followup = None
-if "score_data" not in st.session_state:
-    st.session_state.score_data = None
 
 # ── Load credentials ──────────────────────────────────────────────────────────
 try:
     account_id = st.secrets["CF_ACCOUNT_ID"]
-    api_token = st.secrets["CF_API_TOKEN"]
-except Exception:
-    st.error("⚠️ Server configuration error. Please contact support.")
+    api_token  = st.secrets["CF_API_TOKEN"]
+    client_id     = st.secrets["GOOGLE_CLIENT_ID"]
+    client_secret = st.secrets["GOOGLE_CLIENT_SECRET"]
+    cookie_key    = st.secrets["COOKIE_KEY"]
+    # Comma-separated approved emails in secrets, e.g. APPROVED_EMAILS = "a@gmail.com,b@gmail.com"
+    approved_emails = [e.strip().lower() for e in st.secrets.get("APPROVED_EMAILS", "").split(",") if e.strip()]
+except Exception as e:
+    st.error(f"Server configuration error: {e}")
     st.stop()
 
-# ── AI call helper ────────────────────────────────────────────────────────────
-def call_ai(prompt, system="You are a helpful assistant. Respond only with raw JSON."):
+# ── Google Auth ───────────────────────────────────────────────────────────────
+authenticator = Authenticate(
+    secret_credentials_path=None,
+    cookie_name="cold_email_auth",
+    cookie_key=cookie_key,
+    redirect_uri=st.secrets.get("REDIRECT_URI", "http://localhost:8501"),
+    client_id=client_id,
+    client_secret=client_secret,
+)
+
+authenticator.check_authentification()
+
+if not st.session_state.get("connected", False):
+    st.markdown("""
+    <div class='login-box'>
+        <h2>✉️ Cold Email Writer Pro</h2>
+        <p style='color:#888; margin-bottom:1.5rem;'>Sign in to access your AI email writer</p>
+    </div>
+    """, unsafe_allow_html=True)
+    authenticator.login()
+    st.stop()
+
+# ── Check approved list ───────────────────────────────────────────────────────
+user_email = st.session_state.get("email", "").lower()
+if approved_emails and user_email not in approved_emails:
+    st.error(f"⛔ Access denied. {user_email} is not on the approved list. Please contact support.")
+    if st.button("Sign out"):
+        authenticator.logout()
+    st.stop()
+
+# ── Logged in ─────────────────────────────────────────────────────────────────
+user_name = st.session_state.get("name", "there")
+
+# ── Session state ─────────────────────────────────────────────────────────────
+for key in ["history", "current_email", "current_subject", "variation_b",
+            "subject_b", "followup", "score_data", "subject_vars"]:
+    if key not in st.session_state:
+        st.session_state[key] = [] if key == "history" else None
+
+# ── AI helpers ────────────────────────────────────────────────────────────────
+def call_ai(prompt, system="You are a helpful assistant. Return only raw JSON."):
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/meta/llama-3.1-8b-instruct"
     r = requests.post(
         url,
@@ -84,67 +105,83 @@ def call_ai(prompt, system="You are a helpful assistant. Respond only with raw J
         json={
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
+                {"role": "user",   "content": prompt}
             ],
             "max_tokens": 2048
         },
         timeout=45
     )
     if r.status_code != 200:
-        raise Exception(f"API error {r.status_code}")
+        raise Exception(f"API error {r.status_code}: {r.text}")
     return r.json().get("result", {}).get("response", "")
 
 def extract_json(raw):
     match = re.search(r'\{[\s\S]*\}', raw)
     if not match:
-        raise Exception("No JSON found in response")
+        raise Exception("Could not parse AI response. Try again.")
     return json.loads(match.group())
 
-def score_email(subject, body):
-    prompt = f"""Score this cold email and return ONLY raw JSON:
-Subject: {subject}
-Body: {body}
-
-Return exactly:
-{{"overall": 85, "subject_score": 80, "body_score": 85, "cta_score": 90, "tips": ["tip 1", "tip 2", "tip 3"]}}
-Scores are 0-100. Tips are specific improvements."""
-    raw = call_ai(prompt)
-    return extract_json(raw)
-
 # ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("## ✉️ Cold Email Writer Pro")
-st.markdown("*Generate, refine, score, and perfect your cold emails with AI*")
+col_title, col_user = st.columns([3, 1])
+with col_title:
+    st.markdown("## ✉️ Cold Email Writer Pro")
+    st.markdown("*AI-powered cold emails — generate, refine, score, perfect*")
+with col_user:
+    st.markdown(f"<p style='text-align:right; color:#888; font-size:0.85rem; margin-top:1.2rem;'>👋 {user_name}</p>", unsafe_allow_html=True)
+    if st.button("Sign out", key="signout"):
+        authenticator.logout()
+
 st.divider()
 
-# ── Layout: left inputs, right output ────────────────────────────────────────
-left, right = st.columns([1, 1], gap="large")
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — INPUTS (full width)
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("### ⚙️ Email settings")
 
-with left:
-    st.markdown("### ⚙️ Email settings")
-
-    with st.expander("📋 Business details", expanded=True):
-        biz_name = st.text_input("Business name", placeholder="e.g. NexBot AI")
-        product = st.text_input("Product / service", placeholder="e.g. AI chatbot for restaurants")
-        target = st.text_input("Target customer", placeholder="e.g. local pizza shops in Chicago")
-        benefit = st.text_input("Key benefit", placeholder="e.g. saves 5 hours/week")
+with st.expander("📋 Business details", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        biz_name    = st.text_input("Business name", placeholder="e.g. NexBot AI")
+    with c2:
+        product     = st.text_input("Product / service", placeholder="e.g. AI chatbot for restaurants")
+    with c3:
         sender_name = st.text_input("Your name (optional)", placeholder="e.g. Alex")
+    c4, c5 = st.columns(2)
+    with c4:
+        target      = st.text_input("Target customer", placeholder="e.g. local pizza shops in Chicago")
+    with c5:
+        benefit     = st.text_input("Key benefit", placeholder="e.g. saves 5 hours/week on customer questions")
 
-    with st.expander("🎨 Tone & style", expanded=True):
+with st.expander("🎨 Tone & style", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
         tone = st.select_slider("Tone", options=[
             "Very casual", "Casual", "Friendly & professional",
             "Professional", "Formal", "Very formal"
         ], value="Friendly & professional")
+    with c2:
         energy = st.select_slider("Energy", options=[
             "Very soft", "Soft", "Balanced", "Direct", "Aggressive"
         ], value="Balanced")
+    with c3:
         length = st.select_slider("Length", options=[
             "Very short (50w)", "Short (80w)", "Medium (120w)", "Long (160w)"
         ], value="Short (80w)")
-        humor = st.checkbox("Add a touch of humor 😄")
-        emoji_mode = st.checkbox("Include emojis")
-        ps_line = st.checkbox("Add a P.S. line")
 
-    with st.expander("📣 Call to action"):
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        humor     = st.checkbox("Add humor 😄")
+        emoji_mode = st.checkbox("Include emojis")
+    with c5:
+        ps_line   = st.checkbox("Add a P.S. line")
+        urgency   = st.checkbox("Add urgency")
+    with c6:
+        ab_test         = st.checkbox("Generate A/B variation")
+        gen_followup    = st.checkbox("Generate follow-up email")
+
+with st.expander("📣 Call to action & targeting"):
+    c1, c2, c3 = st.columns(3)
+    with c1:
         cta = st.selectbox("Primary CTA", [
             "Book a free 15-minute call",
             "Reply to this email to learn more",
@@ -153,45 +190,44 @@ with left:
             "Schedule a quick demo",
             "Claim a free audit",
         ])
-        urgency = st.checkbox("Add urgency (limited time / spots)")
-
-    with st.expander("🌍 Language & audience"):
+    with c2:
         language = st.selectbox("Language", [
             "English", "Spanish", "French", "German",
             "Portuguese", "Italian", "Dutch", "Japanese"
         ])
-        industry = st.selectbox("Target industry (optional)", [
+    with c3:
+        industry = st.selectbox("Target industry", [
             "Any", "Restaurant / Food", "Real estate", "E-commerce",
             "Healthcare", "Legal", "Marketing agency", "SaaS / Tech",
             "Retail", "Fitness / Wellness", "Education", "Finance"
         ])
 
-    with st.expander("🔧 Advanced"):
-        ab_test = st.checkbox("Generate A/B variation")
-        gen_followup = st.checkbox("Also generate a follow-up email")
-        auto_score = st.checkbox("Auto-score the email", value=True)
+with st.expander("🔧 Advanced options"):
+    c1, c2 = st.columns(2)
+    with c1:
+        auto_score        = st.checkbox("Auto-score email", value=True)
         subject_variations = st.checkbox("Generate 3 subject line options")
+    with c2:
+        st.markdown("<p style='font-size:0.85rem; color:#888;'>More options coming soon...</p>", unsafe_allow_html=True)
 
-    generate = st.button("✨ Generate email", use_container_width=True, type="primary")
+generate = st.button("✨ Generate email", use_container_width=True, type="primary")
 
-# ── Right column: output ──────────────────────────────────────────────────────
-with right:
-    st.markdown("### 📨 Your email")
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — OUTPUT (full width, below inputs)
+# ════════════════════════════════════════════════════════════════════════════
+if generate:
+    if not biz_name or not product or not target:
+        st.error("Please fill in: business name, product, and target customer.")
+    else:
+        length_map = {
+            "Very short (50w)": "50 words max",
+            "Short (80w)":      "80 words max",
+            "Medium (120w)":    "120 words max",
+            "Long (160w)":      "160 words max",
+        }
+        word_limit = length_map[length]
 
-    if generate:
-        if not biz_name or not product or not target:
-            st.error("Please fill in: business name, product, and target customer.")
-        else:
-            length_map = {
-                "Very short (50w)": "50 words max",
-                "Short (80w)": "80 words max",
-                "Medium (120w)": "120 words max",
-                "Long (160w)": "160 words max",
-            }
-            word_limit = length_map[length]
-
-            base_prompt = f"""Write a cold email with these exact parameters:
-
+        base_prompt = f"""Write a cold email with these exact parameters:
 Business name: {biz_name}
 Product/service: {product}
 Target customer: {target}
@@ -208,212 +244,206 @@ Urgency: {'yes, add urgency' if urgency else 'no'}
 Language: {language}
 Industry context: {industry if industry != 'Any' else 'general'}
 
-Return ONLY raw JSON, no markdown:
+Return ONLY raw JSON, no markdown, no backticks:
 {{"subject":"subject here","body":"body here with \\n for line breaks"}}
 
 Rules:
-- Subject: under 50 chars, no spam words
+- Subject: under 50 chars, curiosity-driven, no spam words
 - No 'I hope this finds you well'
 - Sound human, not robotic
-- Respect the word limit strictly"""
+- Respect the word limit"""
 
-            with st.spinner("Generating your email..."):
+        with st.spinner("✍️ Writing your email..."):
+            try:
+                raw  = call_ai(base_prompt, "You are an expert cold email copywriter. Return only raw JSON.")
+                data = extract_json(raw)
+                st.session_state.current_subject = data.get("subject", "")
+                st.session_state.current_email   = data.get("body", "")
+                st.session_state.variation_b     = None
+                st.session_state.subject_b       = None
+                st.session_state.followup        = None
+                st.session_state.score_data      = None
+                st.session_state.subject_vars    = None
+            except Exception as e:
+                st.error(f"Generation failed: {e}")
+
+        if ab_test and st.session_state.current_email:
+            with st.spinner("🔀 Generating A/B variation..."):
                 try:
-                    raw = call_ai(base_prompt, "You are an expert cold email copywriter. Return only raw JSON.")
-                    data = extract_json(raw)
-                    st.session_state.current_subject = data.get("subject", "")
-                    st.session_state.current_email = data.get("body", "")
-                    st.session_state.variation_b = None
-                    st.session_state.subject_b = None
-                    st.session_state.followup = None
-                    st.session_state.score_data = None
-                except Exception as e:
-                    st.error(f"Generation failed: {e}")
+                    ab_prompt = base_prompt.replace(
+                        "Return ONLY raw JSON",
+                        "Write a COMPLETELY DIFFERENT version with a different angle, hook, and opening. Return ONLY raw JSON"
+                    )
+                    raw_b  = call_ai(ab_prompt, "You are an expert cold email copywriter. Return only raw JSON.")
+                    data_b = extract_json(raw_b)
+                    st.session_state.variation_b = data_b.get("body", "")
+                    st.session_state.subject_b   = data_b.get("subject", "")
+                except Exception:
+                    pass
 
-            # A/B variation
-            if ab_test and st.session_state.current_email:
-                with st.spinner("Generating A/B variation..."):
-                    try:
-                        ab_prompt = base_prompt.replace(
-                            "Return ONLY raw JSON",
-                            "Write a DIFFERENT version with a different angle and opening. Return ONLY raw JSON"
-                        )
-                        raw_b = call_ai(ab_prompt, "You are an expert cold email copywriter. Return only raw JSON.")
-                        data_b = extract_json(raw_b)
-                        st.session_state.variation_b = data_b.get("body", "")
-                        st.session_state.subject_b = data_b.get("subject", "")
-                    except:
-                        pass
-
-            # Follow-up
-            if gen_followup and st.session_state.current_email:
-                with st.spinner("Generating follow-up email..."):
-                    try:
-                        fu_prompt = f"""Write a short follow-up email for someone who didn't reply to this cold email:
-Original email: {st.session_state.current_email}
+        if gen_followup and st.session_state.current_email:
+            with st.spinner("📨 Writing follow-up email..."):
+                try:
+                    fu_prompt = f"""Write a short follow-up cold email for someone who did not reply to this:
+Original: {st.session_state.current_email}
 Business: {biz_name}, Product: {product}, Target: {target}
-Keep it under 60 words, friendly, reference the original email briefly.
-Return ONLY raw JSON: {{"subject":"Re: subject here","body":"followup body here"}}"""
-                        raw_fu = call_ai(fu_prompt, "You are an expert cold email copywriter. Return only raw JSON.")
-                        fu_data = extract_json(raw_fu)
-                        st.session_state.followup = fu_data.get("body", "")
-                    except:
-                        pass
+Keep it under 60 words, friendly, briefly reference the first email.
+Return ONLY raw JSON: {{"subject":"Re: ...","body":"followup body"}}"""
+                    raw_fu  = call_ai(fu_prompt, "You are an expert cold email copywriter. Return only raw JSON.")
+                    fu_data = extract_json(raw_fu)
+                    st.session_state.followup = fu_data.get("body", "")
+                except Exception:
+                    pass
 
-            # Subject variations
-            if subject_variations and st.session_state.current_email:
-                with st.spinner("Generating subject line variations..."):
-                    try:
-                        sv_prompt = f"""Generate 3 different subject lines for this cold email:
+        if subject_variations and st.session_state.current_email:
+            with st.spinner("📌 Generating subject line options..."):
+                try:
+                    sv_prompt = f"""Generate 3 different subject lines for this cold email:
 {st.session_state.current_email}
 Business: {biz_name}, Product: {product}
-Return ONLY raw JSON: {{"subjects": ["subject 1", "subject 2", "subject 3"]}}"""
-                        raw_sv = call_ai(sv_prompt, "Return only raw JSON.")
-                        sv_data = extract_json(raw_sv)
-                        st.session_state.subject_variations = sv_data.get("subjects", [])
-                    except:
-                        st.session_state.subject_variations = []
+Return ONLY raw JSON: {{"subjects":["subject 1","subject 2","subject 3"]}}"""
+                    raw_sv  = call_ai(sv_prompt, "Return only raw JSON.")
+                    sv_data = extract_json(raw_sv)
+                    st.session_state.subject_vars = sv_data.get("subjects", [])
+                except Exception:
+                    pass
 
-            # Auto score
-            if auto_score and st.session_state.current_email:
-                with st.spinner("Scoring your email..."):
-                    try:
-                        st.session_state.score_data = score_email(
-                            st.session_state.current_subject,
-                            st.session_state.current_email
-                        )
-                    except:
-                        pass
+        if auto_score and st.session_state.current_email:
+            with st.spinner("📊 Scoring your email..."):
+                try:
+                    score_prompt = f"""Score this cold email and return ONLY raw JSON:
+Subject: {st.session_state.current_subject}
+Body: {st.session_state.current_email}
+Return exactly:
+{{"overall":85,"subject_score":80,"body_score":85,"cta_score":90,"tips":["tip 1","tip 2","tip 3"]}}
+Scores are 0-100. Tips are specific, actionable improvements."""
+                    raw_sc = call_ai(score_prompt, "You are a cold email expert. Return only raw JSON.")
+                    st.session_state.score_data = extract_json(raw_sc)
+                except Exception:
+                    pass
 
-            # Save to history
-            if st.session_state.current_email:
-                st.session_state.history.insert(0, {
-                    "time": datetime.now().strftime("%H:%M"),
-                    "subject": st.session_state.current_subject,
-                    "body": st.session_state.current_email,
-                    "biz": biz_name,
-                })
-                if len(st.session_state.history) > 20:
-                    st.session_state.history = st.session_state.history[:20]
+        if st.session_state.current_email:
+            st.session_state.history.insert(0, {
+                "time":    datetime.now().strftime("%H:%M"),
+                "subject": st.session_state.current_subject,
+                "body":    st.session_state.current_email,
+                "biz":     biz_name,
+            })
+            if len(st.session_state.history) > 20:
+                st.session_state.history = st.session_state.history[:20]
 
-    # ── Display email ─────────────────────────────────────────────────────────
-    if st.session_state.current_email:
-        tabs = ["📧 Version A"]
-        if st.session_state.variation_b:
-            tabs.append("📧 Version B")
-        if st.session_state.followup:
-            tabs.append("📨 Follow-up")
+# ── Display output ────────────────────────────────────────────────────────────
+if st.session_state.current_email:
+    st.divider()
+    st.markdown("### 📨 Your email")
 
-        tab_objects = st.tabs(tabs)
+    tab_labels = ["📧 Version A"]
+    if st.session_state.variation_b:
+        tab_labels.append("📧 Version B")
+    if st.session_state.followup:
+        tab_labels.append("📨 Follow-up")
+    tabs = st.tabs(tab_labels)
 
-        def show_email(tab, subject, body, label="A"):
-            with tab:
-                st.markdown(f'<div class="subject-box"><strong>Subject:</strong> {subject}</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="email-box">{body}</div>', unsafe_allow_html=True)
+    def show_email_tab(tab, subject, body, key_suffix):
+        with tab:
+            st.markdown(f'<div class="subject-box"><strong>Subject:</strong> {subject}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="email-box">{body}</div>', unsafe_allow_html=True)
 
-                words = len(body.split())
-                c1, c2 = st.columns(2)
-                c1.metric("Words", words)
-                c2.metric("Est. reply rate", "4–7%")
+            words = len(body.split())
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Words", words)
+            m2.metric("Read time", f"~{max(1, words // 200)} min")
+            m3.metric("Est. reply rate", "4–7%")
 
-                # Tone adjustment buttons
-                st.markdown("**Refine this email:**")
-                bc1, bc2, bc3, bc4, bc5, bc6 = st.columns(6)
-                adjustments = {
-                    "😄 Funnier": "more fun and humorous",
-                    "😐 Serious": "more serious and formal",
-                    "✂️ Shorter": "shorter, cut to 60 words max",
-                    "📝 Longer": "longer with more detail",
-                    "💪 Bolder": "more bold and aggressive",
-                    "🕊️ Softer": "softer and more gentle",
-                }
-                buttons = [bc1, bc2, bc3, bc4, bc5, bc6]
-                for i, (btn_label, instruction) in enumerate(adjustments.items()):
-                    if buttons[i].button(btn_label, key=f"adj_{label}_{i}"):
-                        with st.spinner(f"Making it {instruction}..."):
-                            try:
-                                refine_prompt = f"""Rewrite this cold email to be {instruction}. Keep the same core message and CTA.
+            st.markdown("**🎛️ Refine this email:**")
+            adjustments = {
+                "😄 Funnier":  "more fun and humorous",
+                "😐 Serious":  "more serious and formal",
+                "✂️ Shorter":  "shorter, cut to 60 words max",
+                "📝 Longer":   "longer with more detail, 150 words",
+                "💪 Bolder":   "more bold, direct and aggressive",
+                "🕊️ Softer":   "softer, warmer and more gentle",
+                "🎯 Punchier": "punchier with a stronger hook",
+                "🤝 Friendlier": "more friendly and personable",
+            }
+            cols = st.columns(4)
+            for i, (btn_label, instruction) in enumerate(adjustments.items()):
+                if cols[i % 4].button(btn_label, key=f"refine_{key_suffix}_{i}"):
+                    with st.spinner(f"Rewriting..."):
+                        try:
+                            refine_prompt = f"""Rewrite this cold email to be {instruction}. Keep the same core message and CTA.
 Subject: {subject}
 Body: {body}
-Return ONLY raw JSON: {{"subject":"new subject","body":"new body"}}"""
-                                raw_r = call_ai(refine_prompt, "You are an expert cold email copywriter. Return only raw JSON.")
-                                refined = extract_json(raw_r)
-                                if label == "A":
-                                    st.session_state.current_subject = refined.get("subject", subject)
-                                    st.session_state.current_email = refined.get("body", body)
-                                else:
-                                    st.session_state.subject_b = refined.get("subject", subject)
-                                    st.session_state.variation_b = refined.get("body", body)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Refinement failed: {e}")
+Return ONLY raw JSON: {{"subject":"new subject","body":"new body with \\n for line breaks"}}"""
+                            raw_r   = call_ai(refine_prompt, "You are an expert cold email copywriter. Return only raw JSON.")
+                            refined = extract_json(raw_r)
+                            if key_suffix == "A":
+                                st.session_state.current_subject = refined.get("subject", subject)
+                                st.session_state.current_email   = refined.get("body", body)
+                            else:
+                                st.session_state.subject_b   = refined.get("subject", subject)
+                                st.session_state.variation_b = refined.get("body", body)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Refinement failed: {e}")
 
-                full_email = f"Subject: {subject}\n\n{body}"
-                dl1, dl2 = st.columns(2)
-                dl1.download_button(
-                    "⬇️ Download .txt",
-                    data=full_email,
-                    file_name=f"cold_email_{label}.txt",
-                    mime="text/plain",
-                    use_container_width=True,
-                    key=f"dl_{label}"
-                )
-                dl2.download_button(
-                    "⬇️ Download .md",
-                    data=f"# Cold Email\n\n**Subject:** {subject}\n\n---\n\n{body}",
-                    file_name=f"cold_email_{label}.md",
-                    mime="text/markdown",
-                    use_container_width=True,
-                    key=f"dlmd_{label}"
-                )
+            d1, d2 = st.columns(2)
+            d1.download_button("⬇️ Download .txt",
+                data=f"Subject: {subject}\n\n{body}",
+                file_name=f"cold_email_{key_suffix}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                key=f"dl_txt_{key_suffix}")
+            d2.download_button("⬇️ Download .md",
+                data=f"# Cold Email\n\n**Subject:** {subject}\n\n---\n\n{body}",
+                file_name=f"cold_email_{key_suffix}.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key=f"dl_md_{key_suffix}")
 
-        show_email(tab_objects[0], st.session_state.current_subject, st.session_state.current_email, "A")
-        if st.session_state.variation_b and len(tab_objects) > 1:
-            show_email(tab_objects[1], st.session_state.subject_b, st.session_state.variation_b, "B")
-        if st.session_state.followup:
-            with tab_objects[-1]:
-                st.markdown(f'<div class="email-box">{st.session_state.followup}</div>', unsafe_allow_html=True)
-                st.download_button("⬇️ Download follow-up", data=st.session_state.followup, file_name="followup.txt", mime="text/plain")
+    show_email_tab(tabs[0], st.session_state.current_subject, st.session_state.current_email, "A")
+    if st.session_state.variation_b and len(tabs) > 1:
+        show_email_tab(tabs[1], st.session_state.subject_b, st.session_state.variation_b, "B")
+    if st.session_state.followup:
+        with tabs[-1]:
+            st.markdown(f'<div class="email-box">{st.session_state.followup}</div>', unsafe_allow_html=True)
+            st.download_button("⬇️ Download follow-up", data=st.session_state.followup,
+                file_name="followup.txt", mime="text/plain", key="dl_fu")
 
-        # Subject line variations
-        if subject_variations and hasattr(st.session_state, "subject_variations") and st.session_state.subject_variations:
-            st.divider()
-            st.markdown("**📌 Subject line options:**")
-            for i, subj in enumerate(st.session_state.subject_variations, 1):
-                st.markdown(f"`{i}.` {subj}")
+    # Subject variations
+    if st.session_state.subject_vars:
+        st.divider()
+        st.markdown("**📌 Subject line options:**")
+        for i, s in enumerate(st.session_state.subject_vars, 1):
+            st.markdown(f"`{i}.` {s}")
 
-        # Score
-        if st.session_state.score_data:
-            st.divider()
-            st.markdown("**📊 Email score:**")
-            sd = st.session_state.score_data
-            overall = sd.get("overall", 0)
-            color = "#2ecc71" if overall >= 75 else "#f39c12" if overall >= 50 else "#e74c3c"
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Overall", f"{overall}/100")
-            sc2.metric("Subject", f"{sd.get('subject_score', 0)}/100")
-            sc3.metric("Body", f"{sd.get('body_score', 0)}/100")
-            sc4.metric("CTA", f"{sd.get('cta_score', 0)}/100")
-            if sd.get("tips"):
-                st.markdown("**💡 Tips to improve:**")
-                for tip in sd["tips"]:
-                    st.markdown(f"- {tip}")
+    # Score
+    if st.session_state.score_data:
+        st.divider()
+        st.markdown("**📊 Email quality score:**")
+        sd = st.session_state.score_data
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("Overall",  f"{sd.get('overall', 0)}/100")
+        sc2.metric("Subject",  f"{sd.get('subject_score', 0)}/100")
+        sc3.metric("Body",     f"{sd.get('body_score', 0)}/100")
+        sc4.metric("CTA",      f"{sd.get('cta_score', 0)}/100")
+        if sd.get("tips"):
+            st.markdown("**💡 Tips to improve:**")
+            for tip in sd["tips"]:
+                st.markdown(f"- {tip}")
 
-    else:
-        st.info("Fill in the settings on the left and click **Generate email** to get started.")
-
-# ── Email history ─────────────────────────────────────────────────────────────
+# ── History ───────────────────────────────────────────────────────────────────
 if st.session_state.history:
     st.divider()
-    st.markdown("### 🕓 Email history (this session)")
+    st.markdown("### 🕓 Session history")
     for i, item in enumerate(st.session_state.history[:10]):
-        with st.expander(f"{item['time']} — {item['biz']} — {item['subject']}"):
+        with st.expander(f"{item['time']} · {item['biz']} · \"{item['subject']}\""):
             st.markdown(f'<div class="email-box">{item["body"]}</div>', unsafe_allow_html=True)
-            if st.button("Load this email", key=f"load_{i}"):
+            if st.button("↩️ Load this email", key=f"load_{i}"):
                 st.session_state.current_subject = item["subject"]
-                st.session_state.current_email = item["body"]
+                st.session_state.current_email   = item["body"]
                 st.rerun()
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()
-st.markdown("<p style='text-align:center; color:#aaa; font-size:0.8rem;'>Cold Email Writer Pro · Powered by Llama 3.1 via Cloudflare Workers AI</p>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:#aaa;font-size:0.8rem;'>Cold Email Writer Pro · Powered by Llama 3.1 via Cloudflare Workers AI</p>", unsafe_allow_html=True)
